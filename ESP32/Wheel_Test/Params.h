@@ -19,6 +19,18 @@
 #define RS485_TX_PIN 40  // DI (TX) 핀
 #define RS485_RX_PIN 42  // RO (RX) 핀
 
+// Motor PWM pins for DRV8833
+#define MOTOR_L_IN1 25  // Left motor IN1
+#define MOTOR_L_IN2 26  // Left motor IN2
+#define MOTOR_R_IN1 27  // Right motor IN1
+#define MOTOR_R_IN2 33  // Right motor IN2
+
+// Encoder pins for N20 motors
+#define ENC_L_A 32  // Left encoder A
+#define ENC_L_B 34  // Left encoder B
+#define ENC_R_A 35  // Right encoder A
+#define ENC_R_B 36  // Right encoder B
+
 #define SDA_PIN 8   // SDA MPU6050 핀
 #define SCL_PIN 17  // SCL MPU6050 핀
 

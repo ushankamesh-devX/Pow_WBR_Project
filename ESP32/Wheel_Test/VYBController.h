@@ -4,7 +4,6 @@
 #include <Arduino.h>
 #include <ArduinoEigenDense.h>
 #include "Params.h"
-#include "MGServo.h"
 
 /**
  * @class VYBController
@@ -12,30 +11,26 @@
  */
 class VYBController {
 private:
-  MGServo& ServoRW;  ///< 우측 휠 서보
-  MGServo& ServoLW;  ///< 좌측 휠 서보
-
   std::vector<Eigen::Matrix<float, 2, 4>> Ks;  ///< LQR 게인 행렬들의 벡터
   Eigen::Matrix<float, 2, 4> K;                ///< 현재 사용 중인 LQR 게인
   Eigen::Matrix<float, 2, 1> u;                ///< 제어 입력 벡터
 
-  float iq_factor;         ///< 전류 변환 계수 (A/LSB)
-  float torque_constant;   ///< 토크 상수 (Nm/A)
   float saturation;        ///< input saturation
-  const int RW_bias = 12;  ///< 우측 휠 모터의 바이어스 값
 
 public:
   /**
    * @brief 생성자: VYBController 초기화
-   * @param ServoRW_ 우측 휠 서보 객체 참조
-   * @param ServoLW_ 좌측 휠 서보 객체 참조
    */
-  VYBController(MGServo& ServoRW_, MGServo& ServoLW_)
-    : ServoRW(ServoRW_), ServoLW(ServoLW_) {
-    // 전류 및 토크 상수 초기화
-    iq_factor = 0.01611328f;  // (A/LSB) 33 / 2048
-    torque_constant = 0.07f;  // (Nm/A)
-    saturation = iq_factor * torque_constant * MAX_TORQUE_COMMAND;
+  VYBController() {
+    saturation = 255.0f;  // PWM max
+
+
+    // LQR 게인 초기화 (하드코딩된 데이터 삽입)
+    Eigen::Matrix<float, 2, 4> mat;
+    //////////////////////////////////////////////////////////
+    mat << 1.08462239f, 0.12305272f, 0.19382449f, -0.19479993f,
+      -1.10877978f, -0.12702366f, -0.19782372f, -0.19250106f;
+    Ks.push_back(mat);
 
 
     // LQR 게인 초기화 (하드코딩된 데이터 삽입)
@@ -108,54 +103,6 @@ public:
   }
 
   /**
-   * @brief 모터 속도 측정을 수행하여 측정 벡터에 반영
-   * @param z 모터 속도 측정값을 저장할 벡터
-   */
-  void getMotorSpeedMeasurement(Eigen::Matrix<float, 8, 1>& z) {
-    z(6) = ServoRW.getMotorSpeed() * M_PI / 180;
-    z(7) = ServoLW.getMotorSpeed() * M_PI / 180;
-  }
-
-  /**
-  * @brief 모터 Current 측정값 update
-  * @param iq_vec 모터 current 측정값을 저장할 벡터
-  */
-  void getMotorCurrentMeasurement(Eigen::Matrix<float, 2, 1>& iq_vec) {
-    iq_vec << ServoRW.getMotorIq(), ServoLW.getMotorIq();
-  }
-
-  /**
-  * @brief 모터 Current raw 측정값 update
-  * @param iq_raw_vec 모터 current 측정값을 저장할 벡터
-  */
-  void getMotorCurrentMeasurement(Eigen::Matrix<int16_t, 2, 1>& iq_raw_vec) {
-    iq_raw_vec << ServoRW.getMotorIqRaw(), ServoLW.getMotorIqRaw();
-  }
-
-  /**
-   * @brief 현재 높이에 따라 LQR 게인 K를 계산
-   * @param h 현재 높이 (m)
-   */
-  void computeGainK(const float h) {
-    float temp = (h - HEIGHT_MIN) / 0.01;  // 구간을 10mm당 하나씩 나눔
-    int idx = static_cast<int>(temp);      // 구간의 정수 인덱스 계산
-
-    if (idx >= 0 && idx < static_cast<int>(Ks.size()) - 1) {
-      // 보간 비율 계산
-      float ratio = temp - idx;  // 현재 위치가 구간 내에서 차지하는 비율
-
-      // 보간 수행
-      K = Ks.at(idx) * (1.0f - ratio) + Ks.at(idx + 1) * ratio;
-    } else if (idx < 0) {
-      // h가 HEIGHT_MIN 이하일 경우 최소값 사용
-      K = Ks.front();
-    } else {
-      // h가 범위를 벗어날 경우 최대값 사용
-      K = Ks.back();
-    }
-  }
-
-  /**
    * @brief 상태 벡터를 기반으로 제어 입력 벡터를 계산
    * @param x_d 목표 상태 벡터
    * @param x 현재 상태 벡터
@@ -174,33 +121,36 @@ public:
   }
 
   /**
- * @brief 계산된 제어 명령을 서보에 전송
+ * @brief 직접 제어 명령을 모터에 전송 (PWM for DRV8833)
+ * @param pwm_inputs 두 개의 바퀴에 대한 PWM 신호 (-255 to 255)
  */
-  void sendControlCommand() {
-    float u_RW = u(0) / (iq_factor * torque_constant);
-    float u_LW = u(1) / (iq_factor * torque_constant);
+  void sendDirectControlCommand(Eigen::Matrix<int16_t, 2, 1> pwm_inputs) {
+    int16_t pwm_RW = pwm_inputs(0);
+    int16_t pwm_LW = pwm_inputs(1);
 
-    // Right Wheel motor의 마찰로 인해 발생하는 torque 문제를 조정해줌
-    if (u_RW < 0) {
-      u_RW -= RW_bias;
-    } else if (u_RW > 0) {
-      u_RW += RW_bias;
+    // Right motor
+    if (pwm_RW > 0) {
+      ledcWrite(2, pwm_RW);  // IN1
+      ledcWrite(3, 0);       // IN2
+    } else if (pwm_RW < 0) {
+      ledcWrite(2, 0);
+      ledcWrite(3, -pwm_RW);
+    } else {
+      ledcWrite(2, 0);
+      ledcWrite(3, 0);
     }
 
-    ServoRW.sendTorqueControlCommand(static_cast<int16_t>(u_RW));
-    ServoLW.sendTorqueControlCommand(static_cast<int16_t>(u_LW));
-  }
-
-  /**
- * @brief 직접 제어 명령을 서보에 전송
- * @param iq_inputs 두 개의 바퀴에 대한 제어 신호 (Right Wheel, Left Wheel)
- */
-  void sendDirectControlCommand(Eigen::Matrix<int16_t, 2, 1> iq_inputs) {
-    int16_t u_RW = iq_inputs(0);
-    int16_t u_LW = iq_inputs(1);
-
-    ServoRW.sendTorqueControlCommand(u_RW);
-    ServoLW.sendTorqueControlCommand(u_LW);
+    // Left motor
+    if (pwm_LW > 0) {
+      ledcWrite(0, pwm_LW);  // IN1
+      ledcWrite(1, 0);       // IN2
+    } else if (pwm_LW < 0) {
+      ledcWrite(0, 0);
+      ledcWrite(1, -pwm_LW);
+    } else {
+      ledcWrite(0, 0);
+      ledcWrite(1, 0);
+    }
   }
 };
 
