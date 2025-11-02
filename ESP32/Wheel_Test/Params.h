@@ -9,41 +9,64 @@
 #define G_TO_KG(g) ((g)*1e-3)
 #define GMM2_TO_KGM2(gmm2) ((gmm2)*1e-9)
 
-// 핀 번호 정의
-#define LH_PIN 13  // 왼쪽 서보 핀
-#define RH_PIN 21  // 오른쪽 서보 핀
+// ============================================
+// GPIO 핀 번호 정의 (ESP32 DevKit V1)
+// ============================================
 
-#define SBUS_RX_PIN 15  // SBUS 수신 핀
+// Hip Servos (RC PWM Servos)
+#define LH_PIN 13  // 왼쪽 서보 핀 (Left Hip)
+#define RH_PIN 12  // 오른쪽 서보 핀 (Right Hip) - Changed from 21
 
-#define RS485_DE_RE 1    // DE/RE 제어 핀
-#define RS485_TX_PIN 40  // DI (TX) 핀
-#define RS485_RX_PIN 42  // RO (RX) 핀
+// DRV8833 Motor Driver Pins (N20 Motors)
+#define MOTOR_RW_IN1 16  // Right Wheel Motor - Input 1 (PWM)
+#define MOTOR_RW_IN2 17  // Right Wheel Motor - Input 2 (Direction)
+#define MOTOR_LW_IN1 25  // Left Wheel Motor - Input 1 (PWM)
+#define MOTOR_LW_IN2 26  // Left Wheel Motor - Input 2 (Direction)
 
-#define SDA_PIN 8   // SDA MPU6050 핀
-#define SCL_PIN 17  // SCL MPU6050 핀
+// Encoder Pins (N20 Motors)
+#define ENCODER_RW_A 27  // Right Wheel Encoder - Phase A
+#define ENCODER_RW_B 14  // Right Wheel Encoder - Phase B
+#define ENCODER_LW_A 32  // Left Wheel Encoder - Phase A
+#define ENCODER_LW_B 33  // Left Wheel Encoder - Phase B
 
-// 범위 설정 (height와 phi)
+// MPU6050 IMU (I2C) - Using default I2C pins
+#define SDA_PIN 21  // SDA MPU6050 핀 (I2C Data)
+#define SCL_PIN 22  // SCL MPU6050 핀 (I2C Clock)
+
+// ============================================
+// Motor & Encoder Parameters
+// ============================================
+#define ENCODER_PPR 7           // Pulses Per Revolution (motor shaft)
+#define GEAR_RATIO 100          // Gear reduction ratio (adjust for your motor)
+#define WHEEL_PPR (ENCODER_PPR * GEAR_RATIO * 2)  // Total pulses per wheel revolution (×2 for quadrature)
+
+#define PWM_FREQUENCY 20000     // PWM frequency in Hz (20kHz for DRV8833)
+#define PWM_RESOLUTION 8        // 8-bit resolution (0-255)
+
+// ============================================
+// Control Parameters
+// ============================================
 const float HEIGHT_MIN = 0.07;  // 최소 높이 (m)
 const float HEIGHT_MAX = 0.2;   // 최대 높이 (m)
 
 const float PHI_MIN = -30.0;  // phi 최소값 (degree)
 const float PHI_MAX = 30.0;   // phi 최대값 (degree)
 
-const float VEL_MAX = 1;  // 최대 속도 (m/s)
-const float YAW_MAX = 1.5;  // 최대 yaw angular velocity (rad/s)
+const float VEL_MAX = 1.0;      // 최대 속도 (m/s)
+const float YAW_MAX = 1.5;      // 최대 yaw angular velocity (rad/s)
+const int PWM_MAX = 255;        // 최대 PWM 값 (8-bit)
 
-const float MAX_TORQUE_COMMAND = 100.000;  // 최대 torque command
+// ============================================
+// WiFi Configuration (Access Point Mode)
+// ============================================
+const char* ssid = "WBR_Robot";          // WiFi AP 이름
+const char* password = "12345678";       // WiFi AP 비밀번호 (최소 8자)
+const int webServerPort = 80;            // Web server port
 
-// 핫스팟 정보 입력 -> 정보만 입력하면 와이파이 연결 된다.
-// const char* ssid = "Jeongbin";       // 핫스팟 이름
-// const char* password = "james0928";  // 핫스팟 비밀번호
-// const char* ssid = "Woodaengtang";       // 핫스팟 이름
-// const char* password = "jonghyun1234";  // 핫스팟 비밀번호
-const char* ssid = "OSB";       // 핫스팟 이름
-const char* password = "12345678";  // 핫스팟 비밀번호
-
-
-const float dt = 0.003;  // sampling time
+// ============================================
+// Timing Parameters
+// ============================================
+const float dt = 0.005;  // sampling time (5ms = 200Hz) - Increased from 3ms for stability
 
 // mm -> m 단위 변환 함수 (벡터)
 template<typename T>

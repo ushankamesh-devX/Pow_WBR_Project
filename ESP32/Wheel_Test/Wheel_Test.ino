@@ -1,249 +1,280 @@
 #include "Params.h"
-#include "Receiver.h"
-#include "HRController.h"
-#include "VYBController.h"
-#include "MGServo.h"
+#include "WebController.h"     // WiFi web interface (replaces Receiver)
+#include "HRController.h"      // Hip servo controller
+#include "DRV8833_Motor.h"     // N20 motor driver (replaces MGServo)
 #include "IMU.h"
 #include "POL.h"
 #include "Logger.h"
 #include "Timer.h"
 
-
-// Properties와 Receiver, Controller 초기화
+// ============================================
+// Global Objects
+// ============================================
 const Properties properties = createDefaultProperties();
 POL Pol(properties);
-HardwareSerial RS485(1);
-MGServo ServoLW(1, RS485);
-MGServo ServoRW(2, RS485);
-Receiver receiver(Serial2);
+
+// Motor objects (N20 with DRV8833)
+DRV8833_Motor motor_RW(MOTOR_RW_IN1, MOTOR_RW_IN2, ENCODER_RW_A, ENCODER_RW_B, 0);  // Right wheel, PWM channel 0
+DRV8833_Motor motor_LW(MOTOR_LW_IN1, MOTOR_LW_IN2, ENCODER_LW_A, ENCODER_LW_B, 1);  // Left wheel, PWM channel 1
+
+// Web controller (replaces Receiver)
+WebController webControl;
+
+// Hip servos
+HRController HR_controller;
+
+// IMU
 IMU MPU6050;
 
-HRController HR_controller;
-VYBController VYB_controller(ServoRW, ServoLW);
-
+// Logger
 Logger WIFI_Logger(ssid, password);
 
+// State variables
 Eigen::Matrix<float, 8, 1> z = Eigen::Matrix<float, 8, 1>::Zero();
-Eigen::Matrix<int16_t, 2, 1> iq_inputs = Eigen::Matrix<int16_t, 2, 1>::Zero();
-Eigen::Matrix<int16_t, 2, 1> iq_outputs = Eigen::Matrix<int16_t, 2, 1>::Zero();
+int16_t pwm_RW = 0;  // PWM for right wheel
+int16_t pwm_LW = 0;  // PWM for left wheel
 
-int i = 0;
+// Timers
 Timer log_timer(Timer::TimerType::Millis);
 Timer sampling_timer(Timer::TimerType::Millis);
-Timer temp_timer(Timer::TimerType::Micros);
+
+// Control parameters
 float h_d = HEIGHT_MAX, phi_d = 0;
 
-std::vector<int16_t> command_vec;  // torque command vector (LSD)
-int16_t command_max = 1000;
-int16_t command_increment = 10;  // LSD
-int command_idx = 0;
-int dt_command = 42;  // milli sec
+// ============================================
+// Encoder Interrupt Service Routines
+// ============================================
+void IRAM_ATTR encoder_RW_ISR() {
+  // Read encoder B to determine direction
+  if (digitalRead(ENCODER_RW_B) == HIGH) {
+    motor_RW.incrementEncoder();
+  } else {
+    motor_RW.decrementEncoder();
+  }
+}
 
-void serialPrintStates();
+void IRAM_ATTR encoder_LW_ISR() {
+  // Read encoder B to determine direction
+  if (digitalRead(ENCODER_LW_B) == HIGH) {
+    motor_LW.incrementEncoder();
+  } else {
+    motor_LW.decrementEncoder();
+  }
+}
 
 void setup() {
   // ================================
-  // Command 벡터 초기화
+  // Serial Communication
   // ================================
-  for (int16_t command = command_increment; command < command_max; command += command_increment) {
-    command_vec.push_back(command);   // 명령 벡터에 양수 값 추가
-    command_vec.push_back(-command);  // 명령 벡터에 음수 값 추가
-  }
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n\n=================================");
+  Serial.println("WBR Robot - N20 Motor Test");
+  Serial.println("=================================");
 
   // ================================
-  // 시리얼 통신, 리시버, 서보 컨트롤러 초기화
+  // Initialize Motors
   // ================================
-  Serial.begin(115200);                        // 시리얼 통신 시작
-  receiver.begin();                            // 리시버 시작
-  HR_controller.attachServos(LH_PIN, RH_PIN);  // 서보 핀 설정
+  Serial.println("Initializing motors...");
+  motor_RW.begin();
+  motor_LW.begin();
+
+  // Attach encoder interrupts
+  attachInterrupt(digitalPinToInterrupt(ENCODER_RW_A), encoder_RW_ISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_LW_A), encoder_LW_ISR, RISING);
+  Serial.println("Encoders attached");
 
   // ================================
-  // IMU(MPU6050) 초기화
+  // Initialize Hip Servos
   // ================================
+  Serial.println("Initializing hip servos...");
+  HR_controller.attachServos(LH_PIN, RH_PIN);
+  Serial.println("Hip servos ready");
+
+  // ================================
+  // Initialize IMU (MPU6050)
+  // ================================
+  Serial.println("Initializing IMU...");
   if (!MPU6050.begin()) {
-    Serial.println("[ERROR] Fail to initialize IMU.");
-  }
-
-  // ================================
-  // RS485 초기화
-  // ================================
-  pinMode(RS485_DE_RE, OUTPUT);    // RS485 방향 제어 핀 설정
-  digitalWrite(RS485_DE_RE, LOW);  // RS485 수신 모드 설정
-  RS485.begin(460800, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);  // RS485 통신 시작
-
-  // ================================
-  // WIFI 연결 설정
-  // ================================
-  WIFI_Logger.begin();  // WIFI 연결 초기화
-
-  // ================================
-  // PSRAM 상태 확인 및 초기화
-  // ================================
-  if (psramFound()) {
-    Serial.println("PSRAM available.");
-    if (!psramInit()) {
-      Serial.println("PSRAM initialization failed!");
-      while (1) {}  // 초기화 실패 시 무한 루프
-    } else {
-      Serial.println("PSRAM initialized successfully!");
-    }
-    Serial.printf("PSRAM size: %d bytes\n", ESP.getPsramSize());  // PSRAM 크기 출력
-  } else {
-    Serial.println("PSRAM not available.");
-    while (1) {}  // PSRAM 미탐지 시 무한 루프
-  }
-
-  // ================================
-  // SBUS 데이터 수신 대기 (타임아웃 처리)
-  // ================================
-  Timer receiver_timer(Timer::TimerType::Millis);
-  receiver_timer.start();
-  const unsigned long timeout = 5000;  // 타임아웃 5초 설정
-
-  while (!receiver.readData()) {
-    if (receiver_timer.getDuration() > timeout) {
-      Serial.println("Timeout: No data received from SBUS.");
-      receiver_timer.start();  // 타임아웃 초기화
+    Serial.println("[ERROR] Failed to initialize IMU!");
+    while (1) {
+      delay(1000);
     }
   }
-  receiver.updateData();  // 데이터 업데이트
+  Serial.println("IMU ready");
 
   // ================================
-  // Logger pre-allocation
+  // Initialize WiFi Web Controller
   // ================================
-  WIFI_Logger.readyToLogValue("cal_time");
-  WIFI_Logger.readyToLogTimeStamp();            // 시간 기록
-  WIFI_Logger.readyToLogValue("h_d");           // (m)
-  WIFI_Logger.readyToLogValue("tau_RW");        // (LSD)
-  WIFI_Logger.readyToLogValue("tau_LW");        // (LSD)
-  WIFI_Logger.readyToLogValue("acc_x");         // m/s^2
-  WIFI_Logger.readyToLogValue("acc_y");         // m/s^2
-  WIFI_Logger.readyToLogValue("acc_z");         // m/s^2
-  WIFI_Logger.readyToLogValue("gyr_x");         // rad/s
-  WIFI_Logger.readyToLogValue("gyr_y");         // rad/s
-  WIFI_Logger.readyToLogValue("gyr_z");         // rad/s
-  WIFI_Logger.readyToLogValue("theta_dot_RW");  // rad/s
-  WIFI_Logger.readyToLogValue("theta_dot_LW");  // rad/s
-  WIFI_Logger.readyToLogValue("iq_RW");         // (LSD)
-  WIFI_Logger.readyToLogValue("iq_LW");         // (LSD)
-  // WIFI_Logger.readyToLogValue("log_time");      // (us)
-
+  Serial.println("Starting WiFi Access Point...");
+  webControl.begin();
+  Serial.println("WiFi ready - Connect to: " + String(ssid));
+  Serial.println("Visit: http://192.168.4.1");
 
   // ================================
-  // 시간 측정 시작
+  // Initialize Logger
+  // ================================
+  Serial.println("Initializing data logger...");
+  WIFI_Logger.readyToLogValue("loop_time");
+  WIFI_Logger.readyToLogTimeStamp();
+  WIFI_Logger.readyToLogValue("h_d");           // Desired height (m)
+  WIFI_Logger.readyToLogValue("pwm_RW");        // Right wheel PWM
+  WIFI_Logger.readyToLogValue("pwm_LW");        // Left wheel PWM
+  WIFI_Logger.readyToLogValue("speed_RW");      // Right wheel speed (rad/s)
+  WIFI_Logger.readyToLogValue("speed_LW");      // Left wheel speed (rad/s)
+  WIFI_Logger.readyToLogValue("enc_RW");        // Right wheel encoder count
+  WIFI_Logger.readyToLogValue("enc_LW");        // Left wheel encoder count
+  WIFI_Logger.readyToLogValue("acc_x");         // Acceleration X (m/s²)
+  WIFI_Logger.readyToLogValue("acc_y");         // Acceleration Y (m/s²)
+  WIFI_Logger.readyToLogValue("acc_z");         // Acceleration Z (m/s²)
+  WIFI_Logger.readyToLogValue("gyr_x");         // Gyro X (rad/s)
+  WIFI_Logger.readyToLogValue("gyr_y");         // Gyro Y (rad/s)
+  WIFI_Logger.readyToLogValue("gyr_z");         // Gyro Z (rad/s)
+  Serial.println("Logger ready (Capacity: " + String(LOG_INIT_CAP) + " samples)");
+
+  // ================================
+  // Start Timers
   // ================================
   log_timer.start();
   sampling_timer.start();
+
+  Serial.println("=================================");
+  Serial.println("Setup complete! System ready.");
+  Serial.println("=================================\n");
 }
 
 
 void loop() {
-  // sampling time이 경과했을 때만 실행
+  // Handle web client requests continuously
+  webControl.handleClient();
+
+  // Run control loop at fixed sampling rate
   if (sampling_timer.getDuration() >= dt * 1000) {
-    // 경과 시간 출력
-    Serial.print("SamplingTime(ms):");
-    Serial.print(sampling_timer.getDuration());
-    Serial.print(" ");
+    unsigned long loop_start = micros();
+    sampling_timer.start();
 
-    sampling_timer.start();  // sampling timer 초기화
-
-
-    if (receiver.readData()) {
-      receiver.updateData();
+    // ================================
+    // Check control state
+    // ================================
+    if (webControl.isReset()) {
+      // Reset command received
+      Serial.println("RESET command received");
+      motor_RW.stop();
+      motor_LW.stop();
+      motor_RW.resetEncoder();
+      motor_LW.resetEncoder();
+      WIFI_Logger.resetLogData();
+      log_timer.start();
+      return;
     }
 
-    if (receiver.isRun()) {
-      // Running Mode
-      if (i >= dt_command / (dt * 1000)) {
-        if (command_idx < command_vec.size()) {
-          iq_inputs << command_vec.at(command_idx), command_vec.at(command_idx);
-          // iq_inputs << 0, 0;
-          command_idx++;
-          i = 0;
-        } else {
-          iq_inputs << 0, 0;
-        }
+    if (webControl.isRun()) {
+      // ================================
+      // RUN MODE - Active Control
+      // ================================
+      
+      // Get desired states from web interface
+      h_d = webControl.getDesiredHeight();
+      phi_d = webControl.getDesiredRoll();
+      float v_d = webControl.getDesiredVel();
+      float psi_d = webControl.getDesiredYawVel();
+
+      // ================================
+      // Read Sensors
+      // ================================
+      // Read IMU
+      MPU6050.readData();
+      MPU6050.getIMUMeasurement(z);
+
+      // Update motor speeds from encoders
+      motor_RW.updateSpeed();
+      motor_LW.updateSpeed();
+
+      // ================================
+      // Compute Hip Joint Angles
+      // ================================
+      Pol.setHR(h_d, phi_d);
+      Pol.solve_inverse_kinematics();
+      HR_controller.controlHipServos(Pol.get_theta_hips());
+
+      // ================================
+      // Simple Motor Control
+      // (Replace with your control algorithm)
+      // ================================
+      // Example: Simple velocity control
+      int base_pwm = map(v_d * 1000, -1000, 1000, -200, 200);
+      int yaw_pwm = map(psi_d * 100, -150, 150, -100, 100);
+      
+      pwm_RW = constrain(base_pwm - yaw_pwm, -PWM_MAX, PWM_MAX);
+      pwm_LW = constrain(base_pwm + yaw_pwm, -PWM_MAX, PWM_MAX);
+
+      motor_RW.setSpeed(pwm_RW);
+      motor_LW.setSpeed(pwm_LW);
+
+      // ================================
+      // Data Logging (TEMPORARILY DISABLED FOR TESTING)
+      // ================================
+      unsigned long loop_time = micros() - loop_start;
+      
+      // COMMENTED OUT TO TEST MEMORY ISSUE
+      /*
+      WIFI_Logger.logValue("loop_time", loop_time / 1000.0);  // Convert to ms
+      WIFI_Logger.logTimeStamp(log_timer.getDuration());
+      WIFI_Logger.logValue("h_d", h_d);
+      WIFI_Logger.logValue("pwm_RW", pwm_RW);
+      WIFI_Logger.logValue("pwm_LW", pwm_LW);
+      WIFI_Logger.logValue("speed_RW", motor_RW.getSpeedRadS());
+      WIFI_Logger.logValue("speed_LW", motor_LW.getSpeedRadS());
+      WIFI_Logger.logValue("enc_RW", motor_RW.getEncoderCount());
+      WIFI_Logger.logValue("enc_LW", motor_LW.getEncoderCount());
+      WIFI_Logger.logValue("acc_x", z(0));
+      WIFI_Logger.logValue("acc_y", z(1));
+      WIFI_Logger.logValue("acc_z", z(2));
+      WIFI_Logger.logValue("gyr_x", z(3));
+      WIFI_Logger.logValue("gyr_y", z(4));
+      WIFI_Logger.logValue("gyr_z", z(5));
+      */
+
+      // Update web status
+      webControl.setStatus(h_d, v_d, psi_d, z(0), z(1), z(2));
+
+      // Print status every 200ms
+      static unsigned long last_print = 0;
+      if (millis() - last_print >= 200) {
+        Serial.print("PWM: R=");
+        Serial.print(pwm_RW);
+        Serial.print(" L=");
+        Serial.print(pwm_LW);
+        Serial.print(" | Speed: R=");
+        Serial.print(motor_RW.getSpeedRadS(), 2);
+        Serial.print(" L=");
+        Serial.print(motor_LW.getSpeedRadS(), 2);
+        Serial.print(" | Loop:");
+        Serial.print(loop_time);
+        Serial.println("us");
+        last_print = millis();
       }
 
-      receiver.updateDesiredStates();
-      h_d = receiver.getDesiredHeight();
-      phi_d = 0;  // roll control diable
-
-
-      Pol.setHR(h_d, phi_d);
-      // temp_timer.start();
-      Pol.solve_inverse_kinematics();
-      // Serial.print("inverse_kinematics_time(us):");
-      // Serial.print(temp_timer.getDuration());
-      // Serial.print(" ");
-
-      // temp_timer.start();
-      // HR_controller.controlHipServos(Pol.get_theta_hips());
-      VYB_controller.sendDirectControlCommand(iq_inputs);
-      // Serial.print("send_command_time(us):");
-      // Serial.print(temp_timer.getDuration());
-      // Serial.print(" ");
-
-      // temp_timer.start();
-      // measurement update
-      MPU6050.readData();
-      MPU6050.getIMUMeasurement(z);
-      VYB_controller.getMotorSpeedMeasurement(z);
-      VYB_controller.getMotorCurrentMeasurement(iq_outputs);
-      // Serial.print("measurement_update_time(us):");
-      // Serial.print(temp_timer.getDuration());
-      // Serial.print(" ");
-
-      // MPU6050.printData();
-      Serial.println(" Run Mode");
-
-      ///// Logging /////
-      WIFI_Logger.logValue("cal_time", sampling_timer.getDuration());
-
-      // temp_timer.start();
-      WIFI_Logger.logTimeStamp(log_timer.getDuration());  // 시간 기록
-      // state 기록
-      WIFI_Logger.logValue("h_d", h_d);  // (m)
-
-      WIFI_Logger.logValue("tau_RW", iq_inputs(0));  // (LSD)
-      WIFI_Logger.logValue("tau_LW", iq_inputs(1));  // (LSD)
-
-      WIFI_Logger.logValue("acc_x", z(0));                         // m/s^2
-      WIFI_Logger.logValue("acc_y", z(1));                         // m/s^2
-      WIFI_Logger.logValue("acc_z", z(2));                         // m/s^2
-      WIFI_Logger.logValue("gyr_x", z(3));                         // rad/s
-      WIFI_Logger.logValue("gyr_y", z(4));                         // rad/s
-      WIFI_Logger.logValue("gyr_z", z(5));                         // rad/s
-      WIFI_Logger.logValue("theta_dot_RW", z(6));                  // rad/s
-      WIFI_Logger.logValue("theta_dot_LW", z(7));                  // rad/s
-      WIFI_Logger.logValue("iq_RW", iq_outputs(0));                // (LSD)
-      WIFI_Logger.logValue("iq_LW", iq_outputs(1));                // (LSD)
-      // WIFI_Logger.logValue("log_time", temp_timer.getDuration());  // (us)
-      ////////////////////
-
-      i++;
-    } else if (receiver.isReset()) {
-      // Estimator Reset
-      iq_inputs.setZero();
-      WIFI_Logger.resetLogData();
-      i = 0;
-      command_idx = 0;
-      log_timer.start();
-
     } else {
-      // Off Mode
-      ServoLW.sendTorqueControlCommand(0);
-      ServoRW.sendTorqueControlCommand(0);
+      // ================================
+      // STOP MODE - Motors Off
+      // ================================
+      motor_RW.stop();
+      motor_LW.stop();
 
-      // measurement update
+      // Still read IMU for monitoring
       MPU6050.readData();
       MPU6050.getIMUMeasurement(z);
-      VYB_controller.getMotorSpeedMeasurement(z);
-      VYB_controller.getMotorCurrentMeasurement(iq_outputs);
 
-      WIFI_Logger.handleClientRequests();  // Log Data 전송
+      // Handle data download requests
+      WIFI_Logger.handleClientRequests();
 
-      Serial.println(" Off Mode");
+      // Print status
+      static unsigned long last_print_stop = 0;
+      if (millis() - last_print_stop >= 1000) {
+        Serial.println("STOPPED - Waiting for START command");
+        last_print_stop = millis();
+      }
     }
   }
 }

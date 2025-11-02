@@ -4,10 +4,12 @@
 #include <WiFi.h>     // WiFi 관련
 #include <Arduino.h>  // 기본 Arduino 함수들
 #include "Params.h"
-#include "ps_vector.h"
+#include <vector>      // Use standard vector (SRAM) instead of ps_vector (PSRAM)
 #include <map>
 
-const size_t LOG_INIT_CAP = 50000;
+// Reduced capacity for SRAM (ESP32-WROOM-32 has limited memory)
+// 500 samples × ~60 bytes = ~30KB (safer for SRAM)
+const size_t LOG_INIT_CAP = 500;  // Reduced from 2000 to prevent memory issues
 
 class Logger {
 private:
@@ -15,9 +17,9 @@ private:
   const char* ssid;
   const char* password;
 
-  // 데이터 저장소: 필드명을 키로 사용
-  std::map<String, ps_vector<float>> dataStorage;
-  ps_vector<uint32_t> timeStamps;
+  // 데이터 저장소: 필드명을 키로 사용 (SRAM instead of PSRAM)
+  std::map<String, std::vector<float>> dataStorage;
+  std::vector<uint32_t> timeStamps;
 
 
 public:
